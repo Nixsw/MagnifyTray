@@ -1,0 +1,18 @@
+# CMake build trees and generated packages
+/build/
+/build-*/
+/out/
+/dist/
+
+# Visual Studio user and workspace files
+/.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+
+# Editor and operating-system files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
