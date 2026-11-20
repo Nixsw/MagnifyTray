@@ -31,6 +31,7 @@ private:
     bool AddTrayIcon();
     void RemoveTrayIcon() noexcept;
     void HandleHotkey();
+    bool RecheckDeferredClose(ExitCheck check);
     void ShowExitMenu(POINT location);
     void ShowError(const std::wstring& message, unsigned long code) const;
 
@@ -43,6 +44,7 @@ private:
     bool hotkey_registered_ = false;
     bool tray_icon_added_ = false;
     bool toggling_ = false;
+    ULONGLONG deferred_close_deadline_ = 0;
     bool menu_open_ = false;
 
     Win32MagnifierBackend backend_;

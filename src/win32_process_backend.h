@@ -4,11 +4,35 @@
 
 #include <Windows.h>
 
+#include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace magnify {
+
+struct HandleCloser {
+    void operator()(HANDLE handle) const noexcept {
+        if (handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle);
+        }
+    }
+};
+using UniqueHandle = std::unique_ptr<void, HandleCloser>;
+
+enum class ExitCheck { AllowDeferred, Final };
+
+// Keep the exact kernel objects across a timeout, including for multiple instances.
+class ForcedExitBatch {
+public:
+    void Add(UniqueHandle process) { processes_.push_back(std::move(process)); }
+    bool pending() const noexcept { return !processes_.empty(); }
+    std::optional<ErrorInfo> Wait(DWORD timeout_ms, ExitCheck check);
+
+private:
+    std::vector<UniqueHandle> processes_;
+};
 
 struct FileIdentity {
     DWORD volume_serial = 0;
@@ -50,6 +74,10 @@ public:
     std::optional<ErrorInfo> ForceTerminateVerified(
         const std::vector<unsigned long>& pids,
         unsigned long timeout_ms) override;
+    bool HasPendingForcedExit() const noexcept { return forced_exits_.pending(); }
+    std::optional<ErrorInfo> RecheckForcedExit(ExitCheck check) {
+        return forced_exits_.Wait(0, check);
+    }
 
 private:
     bool IsVerifiedProcess(unsigned long pid, ErrorInfo* error) const;
@@ -58,6 +86,7 @@ private:
     std::wstring launch_path_;
     DWORD current_session_id_ = 0;
     std::vector<ExecutableRecord> target_executables_;
+    ForcedExitBatch forced_exits_;
 };
 
 }  // namespace magnify

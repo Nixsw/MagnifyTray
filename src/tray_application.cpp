@@ -20,6 +20,8 @@ constexpr UINT kHotkeyId = 1;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT kTrayCallbackMessage = WM_APP + 1;
 constexpr UINT kExitCommand = 1001;
+constexpr UINT_PTR kCloseConfirmationTimer = 1;
+constexpr UINT kDeferredCloseMs = 4000;
 
 DWORD ShellErrorOrFallback() noexcept {
     const DWORD code = GetLastError();
@@ -55,12 +57,15 @@ int TrayApplication::Run() {
 }
 
 bool TrayApplication::Initialize() {
-    instance_mutex_ = CreateMutexW(nullptr, TRUE, kMutexName);
+    instance_mutex_ = CreateMutexW(nullptr, FALSE, kMutexName);
     if (instance_mutex_ == nullptr) {
         ShowError(L"无法创建单实例互斥锁", GetLastError());
         return false;
     }
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        // Only the running instance should keep the named object alive.
+        CloseHandle(instance_mutex_);
+        instance_mutex_ = nullptr;
         MessageBoxW(
             nullptr,
             L"MagnifyTray 已在运行。",
@@ -134,6 +139,9 @@ bool TrayApplication::Initialize() {
 }
 
 void TrayApplication::Shutdown() noexcept {
+    if (deferred_close_deadline_ != 0 && window_ != nullptr) {
+        KillTimer(window_, kCloseConfirmationTimer);
+    }
     RemoveTrayIcon();
 
     if (hotkey_registered_) {
@@ -191,12 +199,34 @@ void TrayApplication::RemoveTrayIcon() noexcept {
     tray_icon_added_ = false;
 }
 
+bool TrayApplication::RecheckDeferredClose(const ExitCheck check) {
+    const auto error = backend_.RecheckForcedExit(check);
+    if (backend_.HasPendingForcedExit()) {
+        return false; // Still exiting. Keep the original confirmation deadline.
+    }
+    KillTimer(window_, kCloseConfirmationTimer);
+    deferred_close_deadline_ = 0;
+    if (error) {
+        ShowError(error->message, error->code);
+        return false;
+    }
+    return true;
+}
+
 void TrayApplication::HandleHotkey() {
     if (toggling_) {
         return;
     }
 
     toggling_ = true;
+    if (backend_.HasPendingForcedExit()) {
+        const auto check = GetTickCount64() >= deferred_close_deadline_
+            ? ExitCheck::Final : ExitCheck::AllowDeferred;
+        if (!RecheckDeferredClose(check)) {
+            toggling_ = false;
+            return;
+        }
+    }
     const ToggleResult result = controller_.Toggle();
 
     MSG queued_message{};
@@ -206,12 +236,24 @@ void TrayApplication::HandleHotkey() {
         WM_HOTKEY,
         WM_HOTKEY,
         PM_REMOVE)) {
+        if (queued_message.message == WM_QUIT) {
+            PostQuitMessage(static_cast<int>(queued_message.wParam));
+            toggling_ = false;
+            return;
+        }
     }
-    toggling_ = false;
 
     if (result.status == ToggleStatus::Failed) {
-        ShowError(result.error.message, result.error.code);
+        if (backend_.HasPendingForcedExit()) {
+            deferred_close_deadline_ = GetTickCount64() + kDeferredCloseMs;
+            if (!SetTimer(window_, kCloseConfirmationTimer, kDeferredCloseMs, nullptr)) {
+                RecheckDeferredClose(ExitCheck::Final);
+            }
+        } else {
+            ShowError(result.error.message, result.error.code);
+        }
     }
+    toggling_ = false;
 }
 
 void TrayApplication::ShowExitMenu(POINT location) {
@@ -231,7 +273,13 @@ void TrayApplication::ShowExitMenu(POINT location) {
         return;
     }
 
-    AppendMenuW(menu, MF_STRING, kExitCommand, L"退出");
+    if (!AppendMenuW(menu, MF_STRING, kExitCommand, L"退出")) {
+        const DWORD code = GetLastError();
+        DestroyMenu(menu);
+        menu_open_ = false;
+        ShowError(L"无法添加托盘菜单的“退出”命令", code);
+        return;
+    }
     SetForegroundWindow(window_);
     const UINT command = TrackPopupMenu(
         menu,
@@ -297,6 +345,16 @@ LRESULT CALLBACK TrayApplication::WindowProcedure(
     }
 
     switch (message) {
+        case WM_TIMER:
+            if (application != nullptr && w_param == kCloseConfirmationTimer &&
+                !application->toggling_ && application->deferred_close_deadline_ != 0 &&
+                GetTickCount64() >= application->deferred_close_deadline_) {
+                application->toggling_ = true;
+                application->RecheckDeferredClose(ExitCheck::Final);
+                application->toggling_ = false;
+            }
+            return 0;
+
         case WM_HOTKEY:
             if (application != nullptr && w_param == kHotkeyId) {
                 application->HandleHotkey();

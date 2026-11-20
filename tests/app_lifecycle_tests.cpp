@@ -335,9 +335,6 @@ void TestLifecycleAndSingleInstance() {
     ManagedProcess second(executable);
     const HWND duplicate_dialog = WaitForProductDialog(second.pid(), 5000);
     Expect(duplicate_dialog != nullptr, "a duplicate launch must show an already-running dialog");
-    PostMessageW(duplicate_dialog, WM_CLOSE, 0, 0);
-    Expect(second.WaitForExit(3000), "duplicate instance must exit after its dialog closes");
-
     PostMessageW(hidden_window, WM_CLOSE, 0, 0);
     Expect(first.WaitForExit(3000), "primary instance must exit after WM_CLOSE");
 
@@ -348,6 +345,14 @@ void TestLifecycleAndSingleInstance() {
         'W');
     Expect(registration_after_exit, "Alt+W must be released after MagnifyTray exits");
     UnregisterHotKey(nullptr, kTestHotkeyId);
+
+    ManagedProcess restarted(executable);
+    const HWND restarted_window = WaitForHiddenWindow(restarted.pid(), 5000);
+    Expect(restarted_window != nullptr, "an open duplicate dialog must not prevent restarting");
+    PostMessageW(duplicate_dialog, WM_CLOSE, 0, 0);
+    Expect(second.WaitForExit(3000), "duplicate instance must exit after its dialog closes");
+    PostMessageW(restarted_window, WM_CLOSE, 0, 0);
+    Expect(restarted.WaitForExit(3000), "restarted instance must exit cleanly");
 }
 
 }  // namespace

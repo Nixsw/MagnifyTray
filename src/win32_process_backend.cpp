@@ -15,47 +15,6 @@ ErrorInfo MakeError(const DWORD code, const wchar_t* message) {
     return {code, message};
 }
 
-class UniqueHandle {
-public:
-    UniqueHandle() noexcept = default;
-    explicit UniqueHandle(const HANDLE handle) noexcept : handle_(handle) {}
-
-    ~UniqueHandle() {
-        if (handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE) {
-            CloseHandle(handle_);
-        }
-    }
-
-    UniqueHandle(const UniqueHandle&) = delete;
-    UniqueHandle& operator=(const UniqueHandle&) = delete;
-
-    UniqueHandle(UniqueHandle&& other) noexcept : handle_(other.release()) {}
-
-    UniqueHandle& operator=(UniqueHandle&& other) noexcept {
-        if (this != &other) {
-            reset(other.release());
-        }
-        return *this;
-    }
-
-    HANDLE get() const noexcept { return handle_; }
-
-    HANDLE release() noexcept {
-        const HANDLE handle = handle_;
-        handle_ = nullptr;
-        return handle;
-    }
-
-    void reset(const HANDLE handle = nullptr) noexcept {
-        if (handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE) {
-            CloseHandle(handle_);
-        }
-        handle_ = handle;
-    }
-
-private:
-    HANDLE handle_ = nullptr;
-};
 
 std::wstring JoinWindowsPath(const std::wstring& root, const wchar_t* const suffix) {
     std::wstring path = root;
@@ -106,15 +65,15 @@ BOOL CALLBACK CloseMagnifierWindow(const HWND window, const LPARAM parameter) {
 std::optional<ExecutableRecord> ReadExecutableRecord(
     const std::wstring& path,
     ErrorInfo* const error) {
-    const HANDLE file = CreateFileW(
+    UniqueHandle file(CreateFileW(
         path.c_str(),
         FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr,
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL,
-        nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
+        nullptr));
+    if (file.get() == INVALID_HANDLE_VALUE) {
         if (error != nullptr) {
             *error = MakeError(GetLastError(), L"无法读取可执行文件标识");
         }
@@ -122,9 +81,8 @@ std::optional<ExecutableRecord> ReadExecutableRecord(
     }
 
     BY_HANDLE_FILE_INFORMATION information{};
-    if (!GetFileInformationByHandle(file, &information)) {
+    if (!GetFileInformationByHandle(file.get(), &information)) {
         const DWORD code = GetLastError();
-        CloseHandle(file);
         if (error != nullptr) {
             *error = MakeError(code, L"无法读取可执行文件信息");
         }
@@ -136,13 +94,12 @@ std::optional<ExecutableRecord> ReadExecutableRecord(
         static_cast<unsigned long long>(information.nFileIndexLow);
 
     const DWORD required_length = GetFinalPathNameByHandleW(
-        file,
+        file.get(),
         nullptr,
         0,
         FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
     if (required_length == 0) {
         const DWORD code = GetLastError();
-        CloseHandle(file);
         if (error != nullptr) {
             *error = MakeError(code, L"无法规范化可执行文件路径");
         }
@@ -151,12 +108,11 @@ std::optional<ExecutableRecord> ReadExecutableRecord(
 
     std::wstring final_path(static_cast<std::size_t>(required_length) + 1U, L'\0');
     const DWORD copied_length = GetFinalPathNameByHandleW(
-        file,
+        file.get(),
         final_path.data(),
         static_cast<DWORD>(final_path.size()),
         FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
     const DWORD final_path_error = copied_length == 0 ? GetLastError() : ERROR_SUCCESS;
-    CloseHandle(file);
     if (copied_length == 0 || copied_length >= final_path.size()) {
         if (error != nullptr) {
             *error = MakeError(
@@ -313,7 +269,18 @@ std::optional<ErrorInfo> Win32MagnifierBackend::StartAndVerify(
     UniqueHandle process_handle(execution.hProcess);
     const ULONGLONG deadline = GetTickCount64() + timeout_ms;
 
-    do {
+    // The shell can return a launcher (or no handle) when it delegates the launch.
+    if (process_handle.get() != nullptr) {
+        const DWORD pid = GetProcessId(process_handle.get());
+        DWORD session = 0;
+        if (pid != 0 && ProcessIdToSessionId(pid, &session) && session == current_session_id_ &&
+            IsVerifiedProcessHandle(process_handle.get(), nullptr) &&
+            WaitForSingleObject(process_handle.get(), 0) == WAIT_TIMEOUT) {
+            return std::nullopt;
+        }
+    }
+
+    for (;;) {
         const ProcessQuery query = FindVerifiedProcesses();
         if (!query.ok) {
             return query.error;
@@ -321,8 +288,12 @@ std::optional<ErrorInfo> Win32MagnifierBackend::StartAndVerify(
         if (!query.pids.empty()) {
             return std::nullopt;
         }
-        Sleep(50);
-    } while (GetTickCount64() < deadline);
+        const DWORD remaining = RemainingTimeout(deadline);
+        if (remaining == 0) {
+            break;
+        }
+        Sleep(std::min<DWORD>(50, remaining));
+    }
 
     return MakeError(WAIT_TIMEOUT, L"系统放大镜已启动，但未能在时限内确认进程");
 }
@@ -344,7 +315,11 @@ CloseAttempt Win32MagnifierBackend::RequestCloseAndWait(
             }
             return {{}, MakeError(code, L"无法打开系统放大镜进行正常关闭")};
         }
-        if (WaitForSingleObject(process.get(), 0) == WAIT_OBJECT_0) {
+        const DWORD initial_state = WaitForSingleObject(process.get(), 0);
+        if (initial_state == WAIT_FAILED) {
+            return {{}, MakeError(GetLastError(), L"无法查询系统放大镜的退出状态")};
+        }
+        if (initial_state == WAIT_OBJECT_0) {
             continue;
         }
 
@@ -399,7 +374,11 @@ CloseAttempt Win32MagnifierBackend::RequestCloseAndWait(
 
     std::vector<unsigned long> survivors;
     for (auto& process : processes) {
-        if (WaitForSingleObject(process.second.get(), 0) == WAIT_TIMEOUT) {
+        const DWORD state = WaitForSingleObject(process.second.get(), 0);
+        if (state == WAIT_FAILED) {
+            return {{}, MakeError(GetLastError(), L"无法确认系统放大镜已正常退出")};
+        }
+        if (state == WAIT_TIMEOUT) {
             survivors.push_back(process.first);
         }
     }
@@ -409,8 +388,10 @@ CloseAttempt Win32MagnifierBackend::RequestCloseAndWait(
 std::optional<ErrorInfo> Win32MagnifierBackend::ForceTerminateVerified(
     const std::vector<unsigned long>& pids,
     const unsigned long timeout_ms) {
-    std::vector<UniqueHandle> terminated_processes;
-    terminated_processes.reserve(pids.size());
+    if (auto error = RecheckForcedExit(ExitCheck::AllowDeferred)) {
+        return error;
+    }
+    ForcedExitBatch terminated;
 
     for (const unsigned long pid : pids) {
         UniqueHandle process(OpenProcess(
@@ -424,7 +405,11 @@ std::optional<ErrorInfo> Win32MagnifierBackend::ForceTerminateVerified(
             }
             return MakeError(code, L"无法打开系统放大镜进行强制关闭");
         }
-        if (WaitForSingleObject(process.get(), 0) == WAIT_OBJECT_0) {
+        const DWORD initial_state = WaitForSingleObject(process.get(), 0);
+        if (initial_state == WAIT_FAILED) {
+            return MakeError(GetLastError(), L"无法查询系统放大镜的退出状态");
+        }
+        if (initial_state == WAIT_OBJECT_0) {
             continue;
         }
 
@@ -446,29 +431,44 @@ std::optional<ErrorInfo> Win32MagnifierBackend::ForceTerminateVerified(
             if (WaitForSingleObject(process.get(), 0) == WAIT_OBJECT_0) {
                 continue;
             }
-            return MakeError(ERROR_ACCESS_DENIED, L"目标不是已核验的系统放大镜，拒绝强制关闭");
+            if (verification_error.code == ERROR_INVALID_DATA) {
+                return MakeError(ERROR_ACCESS_DENIED, L"目标不是已核验的系统放大镜，拒绝强制关闭");
+            }
+            return verification_error;
         }
 
         if (!TerminateProcess(process.get(), ERROR_CANCELLED)) {
+            const DWORD code = GetLastError();
             if (WaitForSingleObject(process.get(), 0) == WAIT_OBJECT_0) {
                 continue;
             }
-            return MakeError(GetLastError(), L"强制关闭系统放大镜失败");
+            return MakeError(code, L"强制关闭系统放大镜失败");
         }
-        terminated_processes.push_back(std::move(process));
+        terminated.Add(std::move(process));
     }
 
+    forced_exits_ = std::move(terminated);
+    return forced_exits_.Wait(timeout_ms, ExitCheck::AllowDeferred);
+}
+
+std::optional<ErrorInfo> ForcedExitBatch::Wait(const DWORD timeout_ms, const ExitCheck check) {
     const ULONGLONG deadline = GetTickCount64() + timeout_ms;
-    for (auto& process : terminated_processes) {
+    while (!processes_.empty()) {
         const DWORD wait_result = WaitForSingleObject(
-            process.get(),
+            processes_.back().get(),
             RemainingTimeout(deadline));
         if (wait_result == WAIT_TIMEOUT) {
-            return MakeError(WAIT_TIMEOUT, L"系统放大镜在强制关闭后仍未退出");
+            if (check == ExitCheck::Final) {
+                processes_.clear();
+            }
+            return MakeError(WAIT_TIMEOUT, L"系统已接受关闭请求，但尚未确认放大镜退出。请稍后重试。");
         }
         if (wait_result == WAIT_FAILED) {
-            return MakeError(GetLastError(), L"无法确认系统放大镜已强制退出");
+            const DWORD code = GetLastError();
+            processes_.clear();
+            return MakeError(code, L"无法确认系统放大镜已强制退出");
         }
+        processes_.pop_back();
     }
     return std::nullopt;
 }

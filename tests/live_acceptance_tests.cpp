@@ -186,6 +186,8 @@ void WaitForApplicationIdle(const HWND window) {
     if (delivered == 0) {
         throw Failure("MagnifyTray did not finish its current toggle within 5 seconds");
     }
+    // A modal error box also dispatches WM_NULL while disabling its owner.
+    Expect(IsWindowEnabled(window) != FALSE, "MagnifyTray displayed a modal error during the toggle");
 }
 
 void SendAltW() {
@@ -226,15 +228,14 @@ void SendRepeatedAltWKeyDowns() {
     }
 }
 
-void RunLiveAcceptance() {
-    magnify::Win32MagnifierBackend backend;
-    const auto initialization_error = backend.Initialize();
-    Expect(!initialization_error.has_value(), "backend initialization failed");
-    Expect(EnsureMagnifierClosed(backend), "unable to establish a closed initial state");
-
+void RunLiveAcceptance(magnify::Win32MagnifierBackend& backend, bool& cleanup_needed) {
+    Expect(FindWindowW(kWindowClass, nullptr) == nullptr, "exit the running MagnifyTray before live testing");
     ApplicationProcess application;
     const HWND application_window = WaitForApplicationWindow(application.pid(), 5000);
     Expect(application_window != nullptr, "MagnifyTray hidden window did not appear");
+    WaitForApplicationIdle(application_window);
+    Expect(!IsRunning(backend), "close the running Magnifier before live testing");
+    cleanup_needed = true;
 
     for (int cycle = 1; cycle <= 3; ++cycle) {
         const ULONGLONG start_begin = GetTickCount64();
@@ -243,7 +244,6 @@ void RunLiveAcceptance() {
         const ULONGLONG start_visible = GetTickCount64();
         WaitForApplicationIdle(application_window);
         Expect(IsRunning(backend), "Magnifier was not running after the start handler completed");
-        const ULONGLONG start_complete = GetTickCount64();
 
         const ULONGLONG close_begin = GetTickCount64();
         SendAltW();
@@ -251,7 +251,6 @@ void RunLiveAcceptance() {
         const ULONGLONG close_visible = GetTickCount64();
         WaitForApplicationIdle(application_window);
         Expect(!IsRunning(backend), "Magnifier was still running after the close handler completed");
-        const ULONGLONG close_complete = GetTickCount64();
         Expect(
             start_visible - start_begin <= 500,
             "Alt+W start latency exceeded 500 ms");
@@ -260,9 +259,7 @@ void RunLiveAcceptance() {
             "Alt+W close latency exceeded 500 ms");
         std::cout << "Cycle " << cycle
                   << ": start process=" << (start_visible - start_begin)
-                  << " ms, start handler=" << (start_complete - start_begin)
                   << " ms, close process=" << (close_visible - close_begin)
-                  << " ms, close handler=" << (close_complete - close_begin)
                   << " ms.\n";
     }
 
@@ -290,16 +287,18 @@ void RunLiveAcceptance() {
 }  // namespace
 
 int main() {
-    magnify::Win32MagnifierBackend cleanup_backend;
-    cleanup_backend.Initialize();
+    magnify::Win32MagnifierBackend backend;
+    bool cleanup_needed = false;
     try {
-        RunLiveAcceptance();
-        EnsureMagnifierClosed(cleanup_backend);
+        Expect(!backend.Initialize().has_value(), "backend initialization failed");
+        RunLiveAcceptance(backend, cleanup_needed);
         std::cout << "All MagnifyTray live acceptance tests passed.\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
-        EnsureMagnifierClosed(cleanup_backend);
         std::cerr << "FAIL: " << error.what() << '\n';
+        if (cleanup_needed && !EnsureMagnifierClosed(backend)) {
+            std::cerr << "FAIL: could not close the test Magnifier during cleanup\n";
+        }
         return EXIT_FAILURE;
     }
 }

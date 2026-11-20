@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(MagnifyTray VERSION 1.0.0 LANGUAGES CXX RC)
+project(MagnifyTray VERSION 1.0.1 LANGUAGES CXX RC)
 
 if(NOT MSVC OR
    NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR

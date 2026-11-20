@@ -211,6 +211,48 @@ void TestSameNameNonSystemProcessIsIgnoredAndCannotBeTerminated() {
     Expect(fixture.IsRunning(), "unverified same-name process must remain alive");
 }
 
+// Manual-reset events have the same wait semantics as process termination:
+// once signaled they remain signaled. They let us exercise a late exit reliably.
+void TestLateForcedExits() {
+    magnify::ForcedExitBatch batch;
+    magnify::UniqueHandle first(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    magnify::UniqueHandle second(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    Expect(first && second, "must create both waitable objects");
+    const HANDLE first_signal = first.get();
+    const HANDLE second_signal = second.get();
+    batch.Add(std::move(first));
+    batch.Add(std::move(second));
+
+    const auto expired = batch.Wait(1, magnify::ExitCheck::AllowDeferred);
+    Expect(expired && expired->code == WAIT_TIMEOUT && batch.pending(),
+           "an initial timeout must retain the exact outstanding objects");
+    Expect(SetEvent(second_signal) != FALSE, "second exit must signal");
+    const auto partial = batch.Wait(0, magnify::ExitCheck::AllowDeferred);
+    Expect(partial && partial->code == WAIT_TIMEOUT && batch.pending(),
+           "a hotkey recheck must keep waiting for the other instance");
+    Expect(SetEvent(first_signal) != FALSE, "first exit must signal");
+    Expect(!batch.Wait(0, magnify::ExitCheck::Final) && !batch.pending(),
+           "a late confirmed exit must succeed and release all handles");
+}
+
+void TestPersistentForcedExitTimeoutAndWaitError() {
+    magnify::ForcedExitBatch batch;
+    magnify::UniqueHandle original(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    Expect(original != nullptr, "must create the unsignaled waitable object");
+    HANDLE restricted = nullptr;
+    Expect(DuplicateHandle(GetCurrentProcess(), original.get(), GetCurrentProcess(),
+                           &restricted, EVENT_MODIFY_STATE, FALSE, 0) != FALSE,
+           "must create an event handle without synchronize access");
+    batch.Add(magnify::UniqueHandle(restricted));
+    const auto failed = batch.Wait(0, magnify::ExitCheck::AllowDeferred);
+    Expect(failed && failed->code == ERROR_ACCESS_DENIED && !batch.pending(),
+           "a real wait failure must report its own error immediately");
+    batch.Add(std::move(original));
+    const auto expired = batch.Wait(0, magnify::ExitCheck::Final);
+    Expect(expired && expired->code == WAIT_TIMEOUT && !batch.pending(),
+           "an unconfirmed final exit must report timeout and release handles");
+}
+
 }  // namespace
 
 int main() {
@@ -222,6 +264,8 @@ int main() {
         TestExecutableRecordDistinguishesHardLinkLocations();
         TestCurrentProcessSessionCanBeRead();
         TestSameNameNonSystemProcessIsIgnoredAndCannotBeTerminated();
+        TestLateForcedExits();
+        TestPersistentForcedExitTimeoutAndWaitError();
         std::cout << "All MagnifyTray file identity tests passed.\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
